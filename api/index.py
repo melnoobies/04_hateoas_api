@@ -2,214 +2,149 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status, Request
-from pydantic import BaseModel
-from typing import Optional
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import strawberry
+from strawberry.fastapi import GraphQLRouter
+from typing import List, Optional
 
 load_dotenv(override=True)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = FastAPI(
-    title="Order Management API (PostgreSQL + RMM Level 3)",
-    description="REST API Level 3 dengan state transition dinamis gaya PayPal berbasis Neon PostgreSQL.",
-    version="1.0.0",
-    docs_url="/docs",
-    openapi_url="/openapi.json"
-)
-
 def get_db_connection():
-    if not DATABASE_URL:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="DATABASE_URL belum diatur di environment variables."
-        )
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Gagal terhubung ke PostgreSQL: {str(e)}"
-        )
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    return conn
 
-# Inisialisasi tabel orders otomatis jika belum ada
-@app.on_event("startup")
+# Setup tabel awal dan data dummy jika belum ada
 def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
+                CREATE TABLE IF NOT EXISTS categories (
                     id SERIAL PRIMARY KEY,
-                    item VARCHAR(255) NOT NULL,
-                    amount INT NOT NULL,
-                    status VARCHAR(50) DEFAULT 'CREATED',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    name VARCHAR(100) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS products (
+                    id SERIAL PRIMARY KEY,
+                    category_id INT REFERENCES categories(id) ON DELETE CASCADE,
+                    name VARCHAR(255) NOT NULL,
+                    price INT NOT NULL,
+                    stock INT DEFAULT 0,
+                    description TEXT
                 );
             """)
+            # Seed data kategori jika kosong
+            cur.execute("SELECT COUNT(*) FROM categories;")
+            if cur.fetchone()[0] == 0:
+                cur.execute("""
+                    INSERT INTO categories (id, name) VALUES 
+                    (1, 'Electronics'),
+                    (2, 'Accessories');
+                    INSERT INTO products (name, price, stock, description, category_id) VALUES
+                    ('Mechanical Keyboard', 750000, 15, 'RGB Blue Switch', 1),
+                    ('Wireless Mouse', 250000, 30, 'Rechargeable Silent Click', 1),
+                    ('Deskmat XXL', 120000, 50, 'Anti-slip 900x400mm', 2);
+                """)
         conn.close()
     except Exception as e:
-        print(f"Warning saat inisialisasi tabel: {e}")
+        print(f"DB Init Warning: {e}")
 
-class OrderCreate(BaseModel):
-    item: str
-    amount: int
+# ==========================================
+# Definisi GraphQL Types
+# ==========================================
+@strawberry.type
+class Category:
+    id: int
+    name: str
 
-@app.get("/", tags=["General"])
-def root(request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    return {
-        "message": "Order Management API is running on PostgreSQL (RMM Level 3).",
-        "links": [
-            {"rel": "docs", "href": f"{base_url}/docs", "method": "GET"},
-            {"rel": "orders", "href": f"{base_url}/orders", "method": "GET"}
-        ]
-    }
+    @strawberry.field
+    def products(self) -> List["Product"]:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM products WHERE category_id = %s;", (self.id,))
+                rows = cur.fetchall()
+                return [Product(**row) for row in rows]
+        finally:
+            conn.close()
 
-# 1. READ ALL ORDERS
-@app.get("/orders", tags=["Orders"])
-def get_all_orders(request: Request):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM orders ORDER BY id ASC;")
-            orders = cur.fetchall()
+@strawberry.type
+class Product:
+    id: int
+    name: str
+    price: int
+    stock: int
+    description: Optional[str] = None
+    category_id: int
 
-        base_url = str(request.base_url).rstrip("/")
-        orders_list = []
-        for order in orders:
-            order_id = order["id"]
-            orders_list.append({
-                **order,
-                "links": [
-                    {"rel": "self", "href": f"{base_url}/orders/{order_id}", "method": "GET"}
-                ]
-            })
+    @strawberry.field
+    def category(self) -> Optional[Category]:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM categories WHERE id = %s;", (self.category_id,))
+                row = cur.fetchone()
+                return Category(**row) if row else None
+        finally:
+            conn.close()
 
-        return {
-            "total": len(orders_list),
-            "data": orders_list,
-            "links": [
-                {"rel": "self", "href": f"{base_url}/orders", "method": "GET"},
-                {"rel": "create", "href": f"{base_url}/orders", "method": "POST"}
-            ]
-        }
-    finally:
-        conn.close()
+# ==========================================
+# Definisi Query (Resolvers)
+# ==========================================
+@strawberry.type
+class Query:
+    @strawberry.field
+    def products(self) -> List[Product]:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM products ORDER BY id ASC;")
+                rows = cur.fetchall()
+                return [Product(**row) for row in rows]
+        finally:
+            conn.close()
 
-# 2. READ ONE ORDER (Fokus Utama Level 3 HATEOAS)
-@app.get("/orders/{order_id}", tags=["Orders"])
-def get_order(order_id: int, request: Request):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM orders WHERE id = %s;", (order_id,))
-            order = cur.fetchone()
+    @strawberry.field
+    def categories(self) -> List[Category]:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM categories ORDER BY id ASC;")
+                rows = cur.fetchall()
+                return [Category(**row) for row in rows]
+        finally:
+            conn.close()
 
-        if not order:
-            raise HTTPException(status_code=404, detail="Order tidak ditemukan")
+# Inisialisasi Schema dengan introspection aktif
+schema = strawberry.Schema(query=Query)
+graphql_app = GraphQLRouter(schema)
 
-        base_url = str(request.base_url).rstrip("/")
-        links = [
-            {"rel": "self", "href": f"{base_url}/orders/{order_id}", "method": "GET"}
-        ]
+# ==========================================
+# FastAPI App & CORS Setup
+# ==========================================
+app = FastAPI(title="GraphQL Lab 04 API")
 
-        # Hypermedia dinamis mengikuti status transaksi di database
-        if order["status"] == "CREATED":
-            links.append({"rel": "pay", "href": f"{base_url}/orders/{order_id}/pay", "method": "POST"})
-            links.append({"rel": "cancel", "href": f"{base_url}/orders/{order_id}/cancel", "method": "POST"})
-        elif order["status"] == "PAID":
-            links.append({"rel": "refund", "href": f"{base_url}/orders/{order_id}/refund", "method": "POST"})
+# WAJIB: Izinkan domain Apollo Sandbox agar bisa connect tanpa CORS error
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://studio.apollographql.com",
+        "http://localhost:3000",
+        "*"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        links.append({"rel": "all_orders", "href": f"{base_url}/orders", "method": "GET"})
+app.include_router(graphql_app, prefix="/graphql")
 
-        return {
-            **order,
-            "links": links
-        }
-    finally:
-        conn.close()
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
-# 3. CREATE ORDER
-@app.post("/orders", status_code=status.HTTP_201_CREATED, tags=["Orders"])
-def create_order(body: OrderCreate, request: Request):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "INSERT INTO orders (item, amount, status) VALUES (%s, %s, 'CREATED') RETURNING *;",
-                (body.item, body.amount)
-            )
-            new_order = cur.fetchone()
-
-        base_url = str(request.base_url).rstrip("/")
-        order_id = new_order["id"]
-
-        return {
-            **new_order,
-            "links": [
-                {"rel": "self", "href": f"{base_url}/orders/{order_id}", "method": "GET"},
-                {"rel": "pay", "href": f"{base_url}/orders/{order_id}/pay", "method": "POST"},
-                {"rel": "cancel", "href": f"{base_url}/orders/{order_id}/cancel", "method": "POST"}
-            ]
-        }
-    finally:
-        conn.close()
-
-# 4. ACTION: PAY ORDER
-@app.post("/orders/{order_id}/pay", tags=["Orders"])
-def pay_order(order_id: int, request: Request):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM orders WHERE id = %s;", (order_id,))
-            order = cur.fetchone()
-            if not order:
-                raise HTTPException(status_code=404, detail="Order tidak ditemukan")
-            if order["status"] != "CREATED":
-                raise HTTPException(status_code=400, detail=f"Order status '{order['status']}' tidak dapat dibayar")
-
-            cur.execute("UPDATE orders SET status = 'PAID' WHERE id = %s RETURNING *;", (order_id,))
-            updated = cur.fetchone()
-
-        base_url = str(request.base_url).rstrip("/")
-        return {
-            "message": "Pembayaran berhasil diverifikasi",
-            **updated,
-            "links": [
-                {"rel": "self", "href": f"{base_url}/orders/{order_id}", "method": "GET"},
-                {"rel": "refund", "href": f"{base_url}/orders/{order_id}/refund", "method": "POST"},
-                {"rel": "all_orders", "href": f"{base_url}/orders", "method": "GET"}
-            ]
-        }
-    finally:
-        conn.close()
-
-# 5. ACTION: CANCEL ORDER
-@app.post("/orders/{order_id}/cancel", tags=["Orders"])
-def cancel_order(order_id: int, request: Request):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM orders WHERE id = %s;", (order_id,))
-            order = cur.fetchone()
-            if not order:
-                raise HTTPException(status_code=404, detail="Order tidak ditemukan")
-            if order["status"] != "CREATED":
-                raise HTTPException(status_code=400, detail=f"Order status '{order['status']}' tidak dapat dibatalkan")
-
-            cur.execute("UPDATE orders SET status = 'CANCELLED' WHERE id = %s RETURNING *;", (order_id,))
-            updated = cur.fetchone()
-
-        base_url = str(request.base_url).rstrip("/")
-        return {
-            "message": "Order berhasil dibatalkan",
-            **updated,
-            "links": [
-                {"rel": "self", "href": f"{base_url}/orders/{order_id}", "method": "GET"},
-                {"rel": "all_orders", "href": f"{base_url}/orders", "method": "GET"}
-            ]
-        }
-    finally:
-        conn.close()
+@app.get("/")
+def root():
+    return {"message": "GraphQL Server ready at /graphql"}

@@ -11,6 +11,11 @@ from typing import List, Optional
 load_dotenv(override=True)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# ==========================================
+# Variabel Counter Pelacak N+1 Problem
+# ==========================================
+resolver_call_count: int = 0
+
 def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
@@ -61,6 +66,11 @@ class Category:
 
     @strawberry.field
     def products(self) -> List["Product"]:
+        # Increment counter setiap kali resolver relasi ini dieksekusi
+        global resolver_call_count
+        resolver_call_count += 1
+        print(f"[N+1 Tracker] Resolver Category.products dipanggil untuk category id={self.id}! Total pemanggilan: {resolver_call_count}")
+
         conn = get_db_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -96,17 +106,6 @@ class Product:
 @strawberry.type
 class Query:
     @strawberry.field
-    def products(self) -> List[Product]:
-        conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM products ORDER BY id ASC;")
-                rows = cur.fetchall()
-                return [Product(**row) for row in rows]
-        finally:
-            conn.close()
-
-    @strawberry.field
     def categories(self) -> List[Category]:
         conn = get_db_connection()
         try:
@@ -117,6 +116,23 @@ class Query:
         finally:
             conn.close()
 
+    @strawberry.field
+    def products(self) -> List[Product]:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM products ORDER BY id ASC;")
+                rows = cur.fetchall()
+                return [Product(**row) for row in rows]
+        finally:
+            conn.close()
+
+    # Field tambahan sementara untuk melihat nilai counter langsung di response Apollo
+    @strawberry.field
+    def category_products_calls(self) -> int:
+        global resolver_call_count
+        return resolver_call_count
+
 # Inisialisasi Schema dengan introspection aktif
 schema = strawberry.Schema(query=Query)
 graphql_app = GraphQLRouter(schema)
@@ -126,7 +142,6 @@ graphql_app = GraphQLRouter(schema)
 # ==========================================
 app = FastAPI(title="GraphQL Lab 04 API")
 
-# WAJIB: Izinkan domain Apollo Sandbox agar bisa connect tanpa CORS error
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

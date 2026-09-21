@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package ecommerce;
+
+// Definisi struktur data Product
+message Product {
+  int32 id = 1;
+  string title = 2;
+  double price = 3;
+  int32 stock = 4;
+  string description = 5;
+  int32 category_id = 6;
+}
+
+// Parameter input untuk mengambil satu produk berdasarkan ID
+message GetProductRequest {
+  int32 id = 1;
+}
+
+// Service gRPC dengan method GetProduct
+service ProductService {
+  rpc GetProduct (GetProductRequest) returns (Product);
+}
